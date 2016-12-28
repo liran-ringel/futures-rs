@@ -206,7 +206,7 @@ impl<F: Future> Drop for Shared<F> {
                     break; // Invoke only one task
                 };
 
-                // The clone_id starts from 1, so if the clone_id is 0,
+                // The clone_id starts from 1, so if the clone_id is 0, waiters is empty
                 if unparked_clone_id != 0 {
                     waiters.remove(&unparked_clone_id);
                 }
