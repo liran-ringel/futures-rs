@@ -14,9 +14,9 @@
 //! ```
 
 use std::mem;
-use std::vec::Vec;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering::SeqCst;
 use std::ops::Deref;
 
@@ -31,6 +31,7 @@ pub struct Shared<F>
     where F: Future
 {
     inner: Arc<Inner<F>>,
+    clone_id: usize,
 }
 
 struct Inner<F>
@@ -40,6 +41,7 @@ struct Inner<F>
     original_future: Lock<Option<F>>,
     /// Indicates whether the result is ready, and the state is `State::Done`.
     result_ready: AtomicBool,
+    clones_number: AtomicUsize,
     /// The state of the shared future.
     state: RwLock<State<F::Item, F::Error>>,
 }
@@ -48,7 +50,7 @@ struct Inner<F>
 /// 1. Done - contains the result of the original future.
 /// 2. Waiting - contains the waiting tasks.
 enum State<T, E> {
-    Waiting(Vec<Task>),
+    Waiting(HashMap<usize, Task>),
     Done(Result<Arc<T>, Arc<E>>),
 }
 
@@ -61,16 +63,18 @@ impl<F> Shared<F>
             inner: Arc::new(Inner {
                 original_future: Lock::new(Some(future)),
                 result_ready: AtomicBool::new(false),
-                state: RwLock::new(State::Waiting(vec![])),
+                clones_number: AtomicUsize::new(1),
+                state: RwLock::new(State::Waiting(HashMap::new())),
             }),
+            clone_id: 1,
         }
     }
 
     fn park(&self) -> Poll<SharedItem<F::Item>, SharedError<F::Error>> {
         let me = task::park();
         match *self.inner.state.write().unwrap() {
-            State::Waiting(ref mut list) => {
-                list.push(me);
+            State::Waiting(ref mut map) => {
+                map.insert(self.clone_id, me);
                 Ok(Async::NotReady)
             }
             State::Done(Ok(ref e)) => Ok(SharedItem { item: e.clone() }.into()),
@@ -135,7 +139,7 @@ impl<F> Future for Shared<F>
                             State::Done(_) => panic!("store_result() was called twice"),
                         }
                     };
-                    for task in waiters {
+                    for (_, task) in waiters.iter() {
                         task.unpark();
                     }
                 }
@@ -163,7 +167,52 @@ impl<F> Clone for Shared<F>
     where F: Future
 {
     fn clone(&self) -> Self {
-        Shared { inner: self.inner.clone() }
+        let clone_id = self.inner.clones_number.fetch_add(1, SeqCst) + 1;
+        Shared {
+            inner: self.inner.clone(),
+            clone_id: clone_id,
+        }
+    }
+}
+
+impl<F: Future> Drop for Shared<F> {
+    fn drop(&mut self) {
+        // A `Shared` represents a bunch of handles to one original future
+        // running on perhaps a bunch of different tasks.  That one future,
+        // however, is only guaranteed to have at most one task blocked on it.
+        //
+        // If our `Shared` handle is the one which has the task blocked on the
+        // original future, then us being dropped means that we won't ever be
+        // around to wake it up again, but all the other `Shared` handles may
+        // still be interested in the value of the original future!
+        //
+        // To handle this case we implement a destructor which will unpark all
+        // other waiting tasks whenever we're dropped. This should go through
+        // and wake up any interested handles, and at least one of them should
+        // make its way to blocking on the original future itself.
+        if self.inner.result_ready.load(SeqCst) {
+            return
+        }
+
+        match *self.inner.state.write().unwrap() {
+            State::Waiting(ref mut waiters) => {
+                // Removes the dropped `Shared` from the waiters map (if it's there)
+                waiters.remove(&self.clone_id);
+
+                let mut unparked_clone_id: usize = 0;
+                for (clone_id, task) in waiters.iter() {
+                    task.unpark();
+                    unparked_clone_id = *clone_id;
+                    break; // Invoke only one task
+                };
+
+                // The clone_id starts from 1, so if the clone_id is 0,
+                if unparked_clone_id != 0 {
+                    waiters.remove(&unparked_clone_id);
+                }
+            },
+            State::Done(_) => {},
+        };
     }
 }
 
